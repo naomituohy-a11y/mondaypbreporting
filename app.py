@@ -33,13 +33,18 @@ def monday_query(query, variables=None):
 
     return data
 
-if st.button("Pull PB Campaign Rows"):
-    query = """
+def fetch_all_items():
+    all_items = []
+    cursor = None
+    board_name = None
+
+    first_query = """
     query ($board_id: ID!) {
       boards(ids: [$board_id]) {
         id
         name
-        items_page(limit: 25) {
+        items_page(limit: 100) {
+          cursor
           items {
             id
             name
@@ -57,10 +62,45 @@ if st.button("Pull PB Campaign Rows"):
     }
     """
 
-    data = monday_query(query, {"board_id": str(MONDAY_BOARD_ID).strip()})
-
+    data = monday_query(first_query, {"board_id": str(MONDAY_BOARD_ID).strip()})
     board = data["data"]["boards"][0]
-    items = board["items_page"]["items"]
+    board_name = board["name"]
+
+    page = board["items_page"]
+    all_items.extend(page["items"])
+    cursor = page.get("cursor")
+
+    while cursor:
+        next_query = """
+        query ($cursor: String!) {
+          next_items_page(cursor: $cursor, limit: 100) {
+            cursor
+            items {
+              id
+              name
+              column_values {
+                id
+                text
+                value
+                column {
+                  title
+                }
+              }
+            }
+          }
+        }
+        """
+
+        data = monday_query(next_query, {"cursor": cursor})
+        page = data["data"]["next_items_page"]
+
+        all_items.extend(page["items"])
+        cursor = page.get("cursor")
+
+    return board_name, all_items
+
+if st.button("Pull ALL PB Campaign Rows"):
+    board_name, items = fetch_all_items()
 
     rows = []
 
@@ -78,6 +118,15 @@ if st.button("Pull PB Campaign Rows"):
 
     df = pd.DataFrame(rows)
 
-    st.subheader(f"Board: {board['name']}")
+    st.subheader(f"Board: {board_name}")
     st.write(f"Rows pulled: {len(df)}")
     st.dataframe(df)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="Download CSV",
+        data=csv,
+        file_name="pb_commercial_campaigns.csv",
+        mime="text/csv",
+    )
