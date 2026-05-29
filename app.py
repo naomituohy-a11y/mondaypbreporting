@@ -1,8 +1,10 @@
 import os
 import re
+import json
 import requests
 import pandas as pd
 import streamlit as st
+from datetime import datetime, date, timezone
 
 API_URL = "https://api.monday.com/v2"
 
@@ -11,13 +13,14 @@ MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID")
 
 st.set_page_config(page_title="PB Commercial Reporting", layout="wide")
 
-st.title("PB Commercial Reporting Test")
-st.caption("Filtered pull + board schema debugging")
+st.title("PB Commercial Reporting Dashboard")
+st.caption("PB - Live 🟣 | Current reporting data + May activity explorer")
 
 NEEDED_COLUMNS = [
     "Ops Owner",
     "Client",
     "Media Agency",
+    "Go Live Date",
     "MT: Months Target",
     "Pending",
     "MA: Month Approved",
@@ -30,6 +33,20 @@ NEEDED_COLUMNS = [
     "Monthly Rev Delivered $",
     "Monthly Rev Balance $",
     "Pacing",
+    "Status",
+    "Stage",
+]
+
+TRACKED_ACTIVITY_COLUMNS = [
+    "MA: Month Approved",
+    "Pending",
+    "SF_Delivered",
+    "OT: Order Total",
+    "T:May-26",
+    "T:Jun-26",
+    "Go Live Date",
+    "Status",
+    "Stage",
 ]
 
 def monday_query(query, variables=None):
@@ -82,6 +99,88 @@ def clean_number(value):
     return float(match.group())
 
 
+def extract_value(obj):
+    if obj is None:
+        return None
+
+    if isinstance(obj, dict):
+        if "value" in obj and isinstance(obj["value"], (int, float, str)):
+            return obj["value"]
+
+        if "date" in obj:
+            return obj["date"]
+
+        if "label" in obj and isinstance(obj["label"], dict):
+            return obj["label"].get("text")
+
+        if "text" in obj:
+            return obj.get("text")
+
+    if isinstance(obj, (int, float, str)):
+        return obj
+
+    return None
+
+
+def safe_change(old_value, new_value):
+    try:
+        old_num = 0 if old_value is None or old_value == "" else float(old_value)
+        new_num = 0 if new_value is None or new_value == "" else float(new_value)
+        return new_num - old_num
+    except Exception:
+        return None
+
+
+def parse_monday_created_at(value):
+    """
+    Monday activity_logs created_at often comes back as a strange long timestamp string.
+    The actual change timestamp is usually also inside data.value.changed_at.
+    This function falls back safely.
+    """
+    try:
+        text = str(value)
+        if len(text) > 13:
+            text = text[:13]
+        return pd.to_datetime(int(text), unit="ms", utc=True)
+    except Exception:
+        return pd.NaT
+
+
+def get_best_activity_datetime(activity):
+    raw_data = activity.get("data")
+    created_at = parse_monday_created_at(activity.get("created_at"))
+
+    try:
+        parsed = json.loads(raw_data)
+        for key in ["value", "previous_value"]:
+            val = parsed.get(key)
+            if isinstance(val, dict) and val.get("changed_at"):
+                return pd.to_datetime(val.get("changed_at"), utc=True, errors="coerce")
+    except Exception:
+        pass
+
+    return created_at
+
+
+def week_label(dt):
+    if pd.isna(dt):
+        return "Unknown"
+
+    dt = pd.to_datetime(dt)
+    month_start = dt.replace(day=1)
+    month_end = month_start + pd.offsets.MonthEnd(0)
+
+    week_num = ((dt.day - 1) // 7) + 1
+
+    start_day = ((week_num - 1) * 7) + 1
+    end_day = min(start_day + 6, month_end.day)
+
+    start_date = dt.replace(day=start_day)
+    end_date = dt.replace(day=end_day)
+
+    return f"Week {week_num}: {start_date.strftime('%d %b')} - {end_date.strftime('%d %b')}"
+
+
 def get_board_columns():
     query = """
     query ($board_id: ID!) {
@@ -106,7 +205,6 @@ def get_board_columns():
 def find_needed_column_ids(columns):
     found = {}
     missing = []
-
     title_to_col = {col["title"].strip(): col for col in columns}
 
     for needed in NEEDED_COLUMNS:
@@ -149,14 +247,11 @@ def fetch_items_with_columns(column_ids):
     }
     """
 
-    status_text.write("Fetching page 1...")
+    status_text.write("Fetching current board page 1...")
 
     data = monday_query(
         first_query,
-        {
-            "board_id": str(MONDAY_BOARD_ID).strip(),
-            "column_ids": column_ids,
-        },
+        {"board_id": str(MONDAY_BOARD_ID).strip(), "column_ids": column_ids},
     )
 
     page = data["data"]["boards"][0]["items_page"]
@@ -189,17 +284,9 @@ def fetch_items_with_columns(column_ids):
         }
         """
 
-        status_text.write(
-            f"Fetching page {page_count + 1}... Rows so far: {len(all_items)}"
-        )
+        status_text.write(f"Fetching page {page_count + 1}... Rows so far: {len(all_items)}")
 
-        data = monday_query(
-            next_query,
-            {
-                "cursor": cursor,
-                "column_ids": column_ids,
-            },
-        )
+        data = monday_query(next_query, {"cursor": cursor, "column_ids": column_ids})
 
         page = data["data"]["next_items_page"]
         all_items.extend(page["items"])
@@ -217,7 +304,6 @@ def fetch_items_with_columns(column_ids):
 
 def items_to_dataframe(items):
     rows = []
-    debug_rows = []
 
     for item in items:
         row = {
@@ -227,180 +313,20 @@ def items_to_dataframe(items):
 
         for col in item["column_values"]:
             title = col["column"]["title"]
-            text_value = col.get("text")
-            raw_value = col.get("value")
-            value_type = col.get("type")
-
-            row[title] = text_value
-            row[f"{title}__RAW"] = raw_value
-            row[f"{title}__TYPE"] = value_type
-
-            debug_rows.append({
-                "Item ID": item["id"],
-                "Name": item["name"],
-                "Column ID": col["id"],
-                "Column Title": title,
-                "Column Type": value_type,
-                "Text Value": text_value,
-                "Raw Value": raw_value,
-            })
+            row[title] = col.get("text")
+            row[f"{title}__RAW"] = col.get("value")
+            row[f"{title}__TYPE"] = col.get("type")
 
         rows.append(row)
 
-    return pd.DataFrame(rows), pd.DataFrame(debug_rows)
+    return pd.DataFrame(rows)
 
 
-def safe_sum(report, col_name):
-    num_col = col_name + " Num"
-    if num_col in report.columns:
-        return report[num_col].sum()
-    return 0.0
-
-
-if st.button("Pull Filtered PB Reporting Data"):
-    with st.spinner("Getting board columns..."):
-        board_name, columns = get_board_columns()
-
-    st.subheader(f"Board: {board_name}")
-
-    schema_df = pd.DataFrame(columns)
-
-    st.header("Board Schema")
-    st.caption("This tells us what type each monday column is. Formula/mirror/rollup columns may explain blank values.")
-    st.dataframe(schema_df, use_container_width=True)
-
-    schema_csv = schema_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download Board Schema CSV",
-        data=schema_csv,
-        file_name="pb_board_schema.csv",
-        mime="text/csv",
-    )
-
-    found_cols, missing_cols = find_needed_column_ids(columns)
-
-    st.write("Columns found:", len(found_cols))
-    st.write("Columns missing:", len(missing_cols))
-
-    with st.expander("Expected column ID mapping"):
-        st.json(found_cols)
-
-    if missing_cols:
-        st.warning("These expected columns were not found exactly:")
-        st.write(missing_cols)
-
-    column_ids = list(found_cols.values())
-
-    with st.spinner("Pulling filtered campaign data..."):
-        items = fetch_items_with_columns(column_ids)
-
-    df, debug_df = items_to_dataframe(items)
-
-    st.success(f"Rows pulled: {len(df)}")
-
-    st.subheader("Actual columns returned")
-    st.write(df.columns.tolist())
-
-    st.subheader("First 10 rows preview")
-    st.dataframe(df.head(10), use_container_width=True)
-
-    st.subheader("Detailed Column Debug")
-    st.caption("This shows what monday returned as text/raw/type for each cell.")
-    st.dataframe(debug_df.head(500), use_container_width=True)
-
-    numeric_cols = [
-        "MT: Months Target",
-        "Pending",
-        "MA: Month Approved",
-        "MB: Monthly Balance",
-        "OT: Order Total",
-        "TA: Total Approved",
-        "OB: Order Balance",
-        "CPL ($)",
-        "Monthly Rev Target $",
-        "Monthly Rev Delivered $",
-        "Monthly Rev Balance $",
-    ]
-
-    report = df.copy()
-
-    for col in numeric_cols:
-        if col in report.columns:
-            report[col + " Num"] = report[col].apply(clean_number)
-
-    st.header("Basic Summary")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("MT Leads", f"{safe_sum(report, 'MT: Months Target'):,.0f}")
-    c2.metric("MA Leads", f"{safe_sum(report, 'MA: Month Approved'):,.0f}")
-    c3.metric("MB Leads", f"{safe_sum(report, 'MB: Monthly Balance'):,.0f}")
-    c4.metric("Pending Leads", f"{safe_sum(report, 'Pending'):,.0f}")
-
-    c5, c6, c7 = st.columns(3)
-    c5.metric("Monthly Rev Target", f"${safe_sum(report, 'Monthly Rev Target $'):,.0f}")
-    c6.metric("Monthly Rev Delivered", f"${safe_sum(report, 'Monthly Rev Delivered $'):,.0f}")
-    c7.metric("Monthly Rev Balance", f"${safe_sum(report, 'Monthly Rev Balance $'):,.0f}")
-
-    st.header("Largest Revenue Balances")
-
-    if "Monthly Rev Balance $ Num" in report.columns:
-        display_cols = [
-            "Name",
-            "Ops Owner",
-            "Client",
-            "Media Agency",
-            "MT: Months Target",
-            "Pending",
-            "MA: Month Approved",
-            "MB: Monthly Balance",
-            "OT: Order Total",
-            "TA: Total Approved",
-            "OB: Order Balance",
-            "CPL ($)",
-            "Monthly Rev Target $",
-            "Monthly Rev Delivered $",
-            "Monthly Rev Balance $",
-            "Pacing",
-        ]
-
-        display_cols = [col for col in display_cols if col in report.columns]
-
-        balance_df = report.sort_values(
-            by="Monthly Rev Balance $ Num",
-            ascending=False
-        )
-
-        st.dataframe(balance_df[display_cols].head(50), use_container_width=True)
-    else:
-        st.warning("Monthly Rev Balance $ was not found as a readable numeric column.")
-
-    st.header("Download Data")
-
-    csv = report.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download Filtered Report CSV",
-        data=csv,
-        file_name="pb_filtered_reporting_data_debug.csv",
-        mime="text/csv",
-    )
-
-    debug_csv = debug_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download Debug Column Values CSV",
-        data=debug_csv,
-        file_name="pb_column_debug_values.csv",
-        mime="text/csv",
-    )
-
-
-st.divider()
-st.header("May Activity Log Test")
-
-if st.button("Test May Activity Logs"):
+def fetch_activity_logs(limit=500):
     query = """
-    query ($board_id: ID!) {
+    query ($board_id: ID!, $limit: Int!) {
       boards(ids: [$board_id]) {
-        activity_logs(limit: 100) {
+        activity_logs(limit: $limit) {
           id
           event
           data
@@ -411,5 +337,187 @@ if st.button("Test May Activity Logs"):
     }
     """
 
-    data = monday_query(query, {"board_id": str(MONDAY_BOARD_ID).strip()})
-    st.json(data)
+    data = monday_query(
+        query,
+        {
+            "board_id": str(MONDAY_BOARD_ID).strip(),
+            "limit": limit,
+        },
+    )
+
+    return data["data"]["boards"][0]["activity_logs"]
+
+
+def parse_activity_logs(activity_logs):
+    rows = []
+
+    for activity in activity_logs:
+        raw_data = activity.get("data")
+
+        try:
+            parsed = json.loads(raw_data)
+        except Exception:
+            continue
+
+        event = activity.get("event")
+        column_title = parsed.get("column_title")
+        pulse_id = parsed.get("pulse_id") or parsed.get("item_id")
+        pulse_name = parsed.get("pulse_name") or parsed.get("item_name")
+
+        new_value = extract_value(parsed.get("value"))
+        old_value = extract_value(parsed.get("previous_value"))
+        change = safe_change(old_value, new_value)
+
+        activity_dt = get_best_activity_datetime(activity)
+
+        rows.append({
+            "Activity ID": activity.get("id"),
+            "Event": event,
+            "Activity Date": activity_dt,
+            "Week": week_label(activity_dt),
+            "Item ID": pulse_id,
+            "Campaign": pulse_name,
+            "Column ID": parsed.get("column_id"),
+            "Column Title": column_title,
+            "Old Value": old_value,
+            "New Value": new_value,
+            "Change": change,
+            "User ID": activity.get("user_id"),
+            "Raw Data": raw_data,
+        })
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        df["Activity Date"] = pd.to_datetime(df["Activity Date"], errors="coerce", utc=True)
+        df = df.sort_values("Activity Date", ascending=False)
+
+    return df
+
+
+def safe_sum(df, col):
+    if col in df.columns:
+        return df[col].sum()
+    return 0
+
+
+# -----------------------------
+# Current board data
+# -----------------------------
+
+st.header("1. Current PB Board Data")
+
+if st.button("Pull Current Reporting Data"):
+    board_name, columns = get_board_columns()
+    st.subheader(f"Board: {board_name}")
+
+    found_cols, missing_cols = find_needed_column_ids(columns)
+
+    st.write("Columns found:", len(found_cols))
+    st.write("Columns missing:", len(missing_cols))
+
+    if missing_cols:
+        st.warning("Missing expected columns:")
+        st.write(missing_cols)
+
+    with st.expander("Column mapping"):
+        st.json(found_cols)
+
+    items = fetch_items_with_columns(list(found_cols.values()))
+    current_df = items_to_dataframe(items)
+
+    st.success(f"Rows pulled: {len(current_df)}")
+    st.dataframe(current_df.head(100), use_container_width=True)
+
+    csv = current_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Current PB Data CSV",
+        data=csv,
+        file_name="pb_current_reporting_data.csv",
+        mime="text/csv",
+    )
+
+
+# -----------------------------
+# Activity Explorer
+# -----------------------------
+
+st.header("2. Activity Explorer")
+
+activity_limit = st.number_input(
+    "How many activity log records should we pull?",
+    min_value=100,
+    max_value=10000,
+    value=1000,
+    step=100,
+)
+
+start_date = st.date_input("Start date", value=date(2026, 5, 1))
+end_date = st.date_input("End date", value=date(2026, 5, 31))
+
+if st.button("Pull Activity Logs"):
+    with st.spinner("Pulling monday activity logs..."):
+        logs = fetch_activity_logs(limit=int(activity_limit))
+
+    activity_df = parse_activity_logs(logs)
+
+    if activity_df.empty:
+        st.warning("No activity logs returned or parsed.")
+        st.stop()
+
+    start_ts = pd.Timestamp(start_date, tz="UTC")
+    end_ts = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1)
+
+    activity_df = activity_df[
+        (activity_df["Activity Date"] >= start_ts)
+        & (activity_df["Activity Date"] < end_ts)
+    ].copy()
+
+    st.success(f"Parsed activity rows in selected date range: {len(activity_df)}")
+
+    st.subheader("All Parsed Activity")
+    st.dataframe(activity_df, use_container_width=True)
+
+    tracked_df = activity_df[
+        activity_df["Column Title"].isin(TRACKED_ACTIVITY_COLUMNS)
+    ].copy()
+
+    st.subheader("Tracked Reporting Activity")
+    st.caption("Filtered to columns most likely to matter for weekly reporting.")
+    st.dataframe(tracked_df, use_container_width=True)
+
+    if not tracked_df.empty:
+        numeric_df = tracked_df[tracked_df["Change"].notna()].copy()
+
+        st.subheader("Weekly Numeric Movement")
+
+        if not numeric_df.empty:
+            weekly_summary = numeric_df.groupby(
+                ["Week", "Column Title"], dropna=False
+            ).agg(
+                Total_Change=("Change", "sum"),
+                Event_Count=("Activity ID", "count"),
+            ).reset_index()
+
+            st.dataframe(weekly_summary, use_container_width=True)
+
+            pivot = weekly_summary.pivot_table(
+                index="Week",
+                columns="Column Title",
+                values="Total_Change",
+                aggfunc="sum",
+                fill_value=0,
+            ).reset_index()
+
+            st.subheader("Weekly Movement Pivot")
+            st.dataframe(pivot, use_container_width=True)
+        else:
+            st.info("No numeric movement found in tracked activity.")
+
+    csv = activity_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Activity Explorer CSV",
+        data=csv,
+        file_name="pb_activity_explorer.csv",
+        mime="text/csv",
+    )
