@@ -4,17 +4,17 @@ import json
 import requests
 import pandas as pd
 import streamlit as st
-from datetime import datetime, date, timezone
+from datetime import date
 
 API_URL = "https://api.monday.com/v2"
 
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID")
 
-st.set_page_config(page_title="PB Commercial Reporting", layout="wide")
+st.set_page_config(page_title="PB Commercial Weekly Reporting", layout="wide")
 
-st.title("PB Commercial Reporting Dashboard")
-st.caption("PB - Live 🟣 | Current reporting data + May activity explorer")
+st.title("PB Commercial Weekly Reporting")
+st.caption("PB - Live 🟣 | Current board data + weekly activity movement")
 
 NEEDED_COLUMNS = [
     "Ops Owner",
@@ -35,6 +35,9 @@ NEEDED_COLUMNS = [
     "Pacing",
     "Status",
     "Stage",
+    "T:May-26",
+    "T:Jun-26",
+    "SF_Delivered",
 ]
 
 TRACKED_ACTIVITY_COLUMNS = [
@@ -48,6 +51,16 @@ TRACKED_ACTIVITY_COLUMNS = [
     "Status",
     "Stage",
 ]
+
+NUMERIC_ACTIVITY_COLUMNS = [
+    "MA: Month Approved",
+    "Pending",
+    "SF_Delivered",
+    "OT: Order Total",
+    "T:May-26",
+    "T:Jun-26",
+]
+
 
 def monday_query(query, variables=None):
     if not MONDAY_API_TOKEN:
@@ -63,8 +76,11 @@ def monday_query(query, variables=None):
         "Content-Type": "application/json",
     }
 
-    payload = {"query": query, "variables": variables or {}}
-    response = requests.post(API_URL, json=payload, headers=headers)
+    response = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers=headers,
+    )
 
     if response.status_code != 200:
         st.error(f"HTTP Error: {response.status_code}")
@@ -85,12 +101,14 @@ def clean_number(value):
         return 0.0
 
     text = str(value)
-    text = text.replace(",", "")
-    text = text.replace("$", "")
-    text = text.replace("€", "")
-    text = text.replace("£", "")
-    text = text.replace("%", "")
-    text = text.strip()
+    text = (
+        text.replace(",", "")
+        .replace("$", "")
+        .replace("€", "")
+        .replace("£", "")
+        .replace("%", "")
+        .strip()
+    )
 
     match = re.search(r"-?\d+(\.\d+)?", text)
     if not match:
@@ -131,24 +149,8 @@ def safe_change(old_value, new_value):
         return None
 
 
-def parse_monday_created_at(value):
-    """
-    Monday activity_logs created_at often comes back as a strange long timestamp string.
-    The actual change timestamp is usually also inside data.value.changed_at.
-    This function falls back safely.
-    """
-    try:
-        text = str(value)
-        if len(text) > 13:
-            text = text[:13]
-        return pd.to_datetime(int(text), unit="ms", utc=True)
-    except Exception:
-        return pd.NaT
-
-
 def get_best_activity_datetime(activity):
     raw_data = activity.get("data")
-    created_at = parse_monday_created_at(activity.get("created_at"))
 
     try:
         parsed = json.loads(raw_data)
@@ -159,7 +161,13 @@ def get_best_activity_datetime(activity):
     except Exception:
         pass
 
-    return created_at
+    try:
+        created = str(activity.get("created_at"))
+        if len(created) > 13:
+            created = created[:13]
+        return pd.to_datetime(int(created), unit="ms", utc=True)
+    except Exception:
+        return pd.NaT
 
 
 def week_label(dt):
@@ -167,11 +175,9 @@ def week_label(dt):
         return "Unknown"
 
     dt = pd.to_datetime(dt)
-    month_start = dt.replace(day=1)
-    month_end = month_start + pd.offsets.MonthEnd(0)
+    month_end = dt.replace(day=1) + pd.offsets.MonthEnd(0)
 
     week_num = ((dt.day - 1) // 7) + 1
-
     start_day = ((week_num - 1) * 7) + 1
     end_day = min(start_day + 6, month_end.day)
 
@@ -284,7 +290,9 @@ def fetch_items_with_columns(column_ids):
         }
         """
 
-        status_text.write(f"Fetching page {page_count + 1}... Rows so far: {len(all_items)}")
+        status_text.write(
+            f"Fetching page {page_count + 1}... Rows so far: {len(all_items)}"
+        )
 
         data = monday_query(next_query, {"cursor": cursor, "column_ids": column_ids})
 
@@ -322,7 +330,7 @@ def items_to_dataframe(items):
     return pd.DataFrame(rows)
 
 
-def fetch_activity_logs(limit=500):
+def fetch_activity_logs(limit=5000):
     query = """
     query ($board_id: ID!, $limit: Int!) {
       boards(ids: [$board_id]) {
@@ -339,10 +347,7 @@ def fetch_activity_logs(limit=500):
 
     data = monday_query(
         query,
-        {
-            "board_id": str(MONDAY_BOARD_ID).strip(),
-            "limit": limit,
-        },
+        {"board_id": str(MONDAY_BOARD_ID).strip(), "limit": limit},
     )
 
     return data["data"]["boards"][0]["activity_logs"]
@@ -361,6 +366,7 @@ def parse_activity_logs(activity_logs):
 
         event = activity.get("event")
         column_title = parsed.get("column_title")
+
         pulse_id = parsed.get("pulse_id") or parsed.get("item_id")
         pulse_name = parsed.get("pulse_name") or parsed.get("item_name")
 
@@ -370,44 +376,87 @@ def parse_activity_logs(activity_logs):
 
         activity_dt = get_best_activity_datetime(activity)
 
-        rows.append({
-            "Activity ID": activity.get("id"),
-            "Event": event,
-            "Activity Date": activity_dt,
-            "Week": week_label(activity_dt),
-            "Item ID": pulse_id,
-            "Campaign": pulse_name,
-            "Column ID": parsed.get("column_id"),
-            "Column Title": column_title,
-            "Old Value": old_value,
-            "New Value": new_value,
-            "Change": change,
-            "User ID": activity.get("user_id"),
-            "Raw Data": raw_data,
-        })
+        rows.append(
+            {
+                "Activity ID": activity.get("id"),
+                "Event": event,
+                "Activity Date": activity_dt,
+                "Week": week_label(activity_dt),
+                "Item ID": pulse_id,
+                "Campaign": pulse_name,
+                "Column ID": parsed.get("column_id"),
+                "Column Title": column_title,
+                "Old Value": old_value,
+                "New Value": new_value,
+                "Change": change,
+                "User ID": activity.get("user_id"),
+                "Raw Data": raw_data,
+            }
+        )
 
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        df["Activity Date"] = pd.to_datetime(df["Activity Date"], errors="coerce", utc=True)
+        df["Activity Date"] = pd.to_datetime(
+            df["Activity Date"], errors="coerce", utc=True
+        )
         df = df.sort_values("Activity Date", ascending=False)
 
     return df
 
 
-def safe_sum(df, col):
-    if col in df.columns:
-        return df[col].sum()
-    return 0
+def numeric_current_summary(df):
+    summary_cols = [
+        "Pending",
+        "MA: Month Approved",
+        "OT: Order Total",
+        "T:May-26",
+        "T:Jun-26",
+        "SF_Delivered",
+    ]
+
+    summary = {}
+
+    for col in summary_cols:
+        if col in df.columns:
+            nums = df[col].apply(clean_number)
+            summary[col] = nums.sum()
+        else:
+            summary[col] = 0
+
+    return summary
 
 
-# -----------------------------
-# Current board data
-# -----------------------------
+def download_button(df, label, filename):
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label, data=csv, file_name=filename, mime="text/csv")
 
-st.header("1. Current PB Board Data")
 
-if st.button("Pull Current Reporting Data"):
+# -------------------------
+# Sidebar controls
+# -------------------------
+
+st.sidebar.header("Controls")
+
+activity_limit = st.sidebar.number_input(
+    "Activity log records to pull",
+    min_value=1000,
+    max_value=10000,
+    value=5000,
+    step=1000,
+)
+
+start_date = st.sidebar.date_input("Start date", value=date(2026, 5, 1))
+end_date = st.sidebar.date_input("End date", value=date(2026, 5, 31))
+
+
+# -------------------------
+# Current board pull
+# -------------------------
+
+st.header("1. Current PB Board Position")
+
+if st.button("Pull Current Board Data"):
     board_name, columns = get_board_columns()
     st.subheader(f"Board: {board_name}")
 
@@ -427,42 +476,43 @@ if st.button("Pull Current Reporting Data"):
     current_df = items_to_dataframe(items)
 
     st.success(f"Rows pulled: {len(current_df)}")
-    st.dataframe(current_df.head(100), use_container_width=True)
 
-    csv = current_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download Current PB Data CSV",
-        data=csv,
-        file_name="pb_current_reporting_data.csv",
-        mime="text/csv",
+    current_summary = numeric_current_summary(current_df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current MA Approved", f"{current_summary['MA: Month Approved']:,.0f}")
+    c2.metric("Current Pending", f"{current_summary['Pending']:,.0f}")
+    c3.metric("Order Total", f"{current_summary['OT: Order Total']:,.0f}")
+    c4.metric("SF Delivered", f"{current_summary['SF_Delivered']:,.0f}")
+
+    c5, c6 = st.columns(2)
+    c5.metric("T:May-26", f"{current_summary['T:May-26']:,.0f}")
+    c6.metric("T:Jun-26", f"{current_summary['T:Jun-26']:,.0f}")
+
+    st.subheader("Current Data Preview")
+    st.dataframe(current_df.head(200), use_container_width=True)
+
+    download_button(
+        current_df,
+        "Download Current Board Data CSV",
+        "pb_current_board_data.csv",
     )
 
 
-# -----------------------------
-# Activity Explorer
-# -----------------------------
+# -------------------------
+# Activity reporting
+# -------------------------
 
-st.header("2. Activity Explorer")
+st.header("2. Weekly Activity Reporting")
 
-activity_limit = st.number_input(
-    "How many activity log records should we pull?",
-    min_value=100,
-    max_value=10000,
-    value=1000,
-    step=100,
-)
-
-start_date = st.date_input("Start date", value=date(2026, 5, 1))
-end_date = st.date_input("End date", value=date(2026, 5, 31))
-
-if st.button("Pull Activity Logs"):
+if st.button("Pull Weekly Activity"):
     with st.spinner("Pulling monday activity logs..."):
         logs = fetch_activity_logs(limit=int(activity_limit))
 
     activity_df = parse_activity_logs(logs)
 
     if activity_df.empty:
-        st.warning("No activity logs returned or parsed.")
+        st.warning("No activity logs returned.")
         st.stop()
 
     start_ts = pd.Timestamp(start_date, tz="UTC")
@@ -475,49 +525,88 @@ if st.button("Pull Activity Logs"):
 
     st.success(f"Parsed activity rows in selected date range: {len(activity_df)}")
 
-    st.subheader("All Parsed Activity")
-    st.dataframe(activity_df, use_container_width=True)
-
     tracked_df = activity_df[
         activity_df["Column Title"].isin(TRACKED_ACTIVITY_COLUMNS)
     ].copy()
 
-    st.subheader("Tracked Reporting Activity")
-    st.caption("Filtered to columns most likely to matter for weekly reporting.")
-    st.dataframe(tracked_df, use_container_width=True)
+    numeric_df = tracked_df[
+        tracked_df["Column Title"].isin(NUMERIC_ACTIVITY_COLUMNS)
+        & tracked_df["Change"].notna()
+    ].copy()
 
-    if not tracked_df.empty:
-        numeric_df = tracked_df[tracked_df["Change"].notna()].copy()
+    st.subheader("Executive Weekly Movement")
 
-        st.subheader("Weekly Numeric Movement")
-
-        if not numeric_df.empty:
-            weekly_summary = numeric_df.groupby(
-                ["Week", "Column Title"], dropna=False
-            ).agg(
+    if numeric_df.empty:
+        st.warning("No numeric activity found for tracked reporting columns.")
+    else:
+        weekly_summary = (
+            numeric_df.groupby(["Week", "Column Title"], dropna=False)
+            .agg(
                 Total_Change=("Change", "sum"),
                 Event_Count=("Activity ID", "count"),
-            ).reset_index()
+            )
+            .reset_index()
+        )
 
-            st.dataframe(weekly_summary, use_container_width=True)
+        weekly_pivot = weekly_summary.pivot_table(
+            index="Week",
+            columns="Column Title",
+            values="Total_Change",
+            aggfunc="sum",
+            fill_value=0,
+        ).reset_index()
 
-            pivot = weekly_summary.pivot_table(
-                index="Week",
-                columns="Column Title",
-                values="Total_Change",
-                aggfunc="sum",
-                fill_value=0,
-            ).reset_index()
+        st.dataframe(weekly_pivot, use_container_width=True)
 
-            st.subheader("Weekly Movement Pivot")
-            st.dataframe(pivot, use_container_width=True)
-        else:
-            st.info("No numeric movement found in tracked activity.")
+        st.subheader("Weekly Activity Detail")
+        st.dataframe(
+            numeric_df[
+                [
+                    "Activity Date",
+                    "Week",
+                    "Campaign",
+                    "Column Title",
+                    "Old Value",
+                    "New Value",
+                    "Change",
+                    "Event",
+                    "User ID",
+                ]
+            ],
+            use_container_width=True,
+        )
 
-    csv = activity_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download Activity Explorer CSV",
-        data=csv,
-        file_name="pb_activity_explorer.csv",
-        mime="text/csv",
+        st.subheader("Top Campaign Movements")
+
+        top_campaigns = (
+            numeric_df.groupby(["Campaign", "Column Title"], dropna=False)
+            .agg(
+                Total_Change=("Change", "sum"),
+                Event_Count=("Activity ID", "count"),
+            )
+            .reset_index()
+            .sort_values("Total_Change", ascending=False)
+        )
+
+        st.dataframe(top_campaigns.head(100), use_container_width=True)
+
+        download_button(
+            weekly_pivot,
+            "Download Weekly Pivot CSV",
+            "pb_weekly_activity_pivot.csv",
+        )
+
+        download_button(
+            numeric_df,
+            "Download Numeric Activity Detail CSV",
+            "pb_numeric_activity_detail.csv",
+        )
+
+    st.subheader("All Parsed Activity")
+    st.dataframe(activity_df, use_container_width=True)
+
+    download_button(
+        activity_df,
+        "Download All Parsed Activity CSV",
+        "pb_all_parsed_activity.csv",
     )
